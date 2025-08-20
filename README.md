@@ -157,5 +157,5 @@ PRs and issues welcome. Keep changes platform‑agnostic when possible.
 
 ## 📜 License
 
-MIT is a common choice.
+MIT
 
