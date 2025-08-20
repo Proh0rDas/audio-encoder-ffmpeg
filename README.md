@@ -55,7 +55,7 @@ pip install PyQt5
 ## ▶️ Run
 
 ```bash
-python audionormalizationeaac_v5.py
+python audionormalizationeaac.py
 ```
 
 > Prefer **v5** for audio‑only workflows. If you only process video+audio and never see `N/A`, v3 is also fine.
