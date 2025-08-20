@@ -33,8 +33,8 @@ Shows **per‑file progress**, **ETA**, and an **overall queue**. Includes robus
 ## 📦 Install
 
 ```bash
-git clone <your-repo-url>.git
-cd <repo>
+git clone https://github.com/Proh0rDas/audio-encoder-ffmpeg.git
+cd audio-encoder-ffmpeg
 python -m venv .venv
 # Windows
 .venv\Scripts\activate
