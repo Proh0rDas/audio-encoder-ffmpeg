@@ -157,5 +157,5 @@ PRs and issues welcome. Keep changes platform‑agnostic when possible.
 
 ## 📜 License
 
-Add a license file to the repo (MIT is a common choice).
+MIT is a common choice.
 
