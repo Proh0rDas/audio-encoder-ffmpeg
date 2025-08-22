@@ -1,4 +1,3 @@
-
 import sys
 import os
 import subprocess
@@ -8,7 +7,7 @@ import time
 import threading
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QFileDialog, QProgressBar,
-                             QTextEdit, QGroupBox, QComboBox, QMessageBox, QSplitter)
+                             QTextEdit, QGroupBox, QComboBox, QMessageBox, QSplitter, QCheckBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 
@@ -69,17 +68,65 @@ class AudioConverterThread(QThread):
             pass
 
     def get_audio_stream_metadata(self, file_path):
-        cmd = ["ffprobe","-v","quiet","-print_format","json",
-               "-show_entries","stream=index:codec_type:codec_name:channels:sample_rate",
-               "-select_streams","a", file_path]
+        """
+        Try multiple ways to discover audio streams. Do NOT fail the whole file if probing breaks.
+        Returns a list of audio stream dicts, or [] if unknown.
+        """
+        cmd1 = ["ffprobe","-v","quiet","-print_format","json",
+                "-show_entries","stream=index:codec_type:codec_name:channels:sample_rate",
+                "-select_streams","a", file_path]
         try:
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, check=True, encoding="utf-8", errors="replace")
-            data = json.loads(result.stdout)
+            p = subprocess.run(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, check=True, encoding="utf-8", errors="replace")
+            data = json.loads(p.stdout or "{}")
             return data.get("streams", [])
+        except Exception as e1:
+            self.log_updated.emit(f"Audio probe fallback #1: {os.path.basename(file_path)} ({e1})")
+            cmd2 = ["ffprobe","-v","error","-of","json","-show_streams", file_path]
+            try:
+                p2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, check=True, encoding="utf-8", errors="replace")
+                data2 = json.loads(p2.stdout or "{}")
+                streams = [s for s in data2.get("streams", []) if s.get("codec_type") == "audio"]
+                return streams
+            except Exception as e2:
+                self.log_updated.emit(f"Audio probe fallback #2: {os.path.basename(file_path)} ({e2})")
+                try:
+                    p3 = subprocess.run(["ffprobe","-show_streams","-of","json", file_path],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True, check=False, encoding="utf-8", errors="replace")
+                    data3 = json.loads(p3.stdout or "{}")
+                    streams = [s for s in data3.get("streams", []) if s.get("codec_type") == "audio"]
+                    return streams
+                except Exception as e3:
+                    self.log_updated.emit(f"Audio probe failed for {os.path.basename(file_path)}: {e3}")
+                    return []  # unknown
+
+    def get_video_info(self, file_path):
+        """
+        Probe first video stream for pix_fmt/codec/profile/level. Return dict, tolerate failures.
+        """
+        cmd = ["ffprobe","-v","error","-select_streams","v:0",
+               "-show_entries","stream=pix_fmt,codec_name,profile,level",
+               "-of","json", file_path]
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, check=True, encoding="utf-8", errors="replace")
+            data = json.loads(p.stdout or "{}")
+            streams = data.get("streams", [])
+            return streams[0] if streams else {}
         except Exception as e:
-            self.log_updated.emit(f"Could not probe audio streams for {os.path.basename(file_path)}. Error: {e}")
-            return []
+            self.log_updated.emit(f"Video probe failed for {os.path.basename(file_path)}: {e}")
+            return {}
+
+    def is_high_bit_depth(self, pix_fmt, profile):
+        s1 = (pix_fmt or "").lower()
+        s2 = (profile or "").lower()
+        # common 10/12/16-bit indicators
+        high = any(tag in s1 for tag in ["p10", "p12", "p14", "p16", "yuv420p10", "yuv444p10", "yuv422p10", "rgb48"])
+        if ("10" in s2) or ("12" in s2) or ("main10" in s2) or ("high 10" in s2):
+            high = True
+        return high
 
     def get_duration_seconds(self, file_path):
         cmd = ["ffprobe","-v","error","-show_entries","format=duration",
@@ -97,7 +144,7 @@ class AudioConverterThread(QThread):
                "-of","json", file_path]
         try:
             out = subprocess.check_output(cmd, text=True, encoding="utf-8", errors="replace")
-            data = json.loads(out)
+            data = json.loads(out or "{}")
             rates = []
             for st in data.get("streams", []):
                 try:
@@ -144,33 +191,65 @@ class AudioConverterThread(QThread):
                 self.log_updated.emit(f"Processing {base_name}...")
 
                 audio_streams = self.get_audio_stream_metadata(input_path)
+                video_info = self.get_video_info(input_path)
                 duration_s = self.get_duration_seconds(input_path)
 
+                # audio stream count for size-based estimate if needed
+                assumed_count = len(audio_streams) if audio_streams else 1
                 if not audio_streams:
-                    self.log_updated.emit(f"Skipping '{base_name}': No audio streams found.")
-                    self._emit_overall(i, 1.0, total_files)
-                    continue
+                    self.log_updated.emit(f"Proceeding without probe for {base_name}: assuming {assumed_count} audio stream(s).")
 
                 # Build command
                 ffmpeg_cmd = ["ffmpeg", "-y", "-nostdin", "-hide_banner",
                               "-progress", "pipe:1", "-nostats", "-loglevel", "error",
                               "-i", input_path,
-                              "-map", "0",
-                              "-c:v", self.config["video_codec"],
-                              "-c:s", self.config["subtitle_codec"],
-                              "-c:t", "copy", "-c:d", "copy"]
+                              "-map", "0"]
 
+                # ---- VIDEO handling (Jellyfin-friendly) ----
+                selected_v = self.config["video_codec"]
+                force_8bit = bool(self.config.get("force_8bit"))
+                pix_fmt = video_info.get("pix_fmt")
+                profile = video_info.get("profile")
+                need_8bit = self.is_high_bit_depth(pix_fmt, profile)
+
+                if force_8bit or (selected_v == "copy" and need_8bit):
+                    # Auto-upgrade to libx264 8-bit High@4.1 for compatibility
+                    self.log_updated.emit(f"Video is high bit-depth ({pix_fmt or 'unknown'}/{profile or 'unknown'}). Transcoding to 8‑bit H.264 for Direct Play.")
+                    selected_v = "libx264"
+
+                ffmpeg_cmd.extend(["-c:v", selected_v])
+
+                if selected_v == "libx264":
+                    crf = str(self.config.get("x264_crf", 18))
+                    preset = str(self.config.get("x264_preset", "slow"))
+                    ffmpeg_cmd.extend(["-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.1",
+                                       "-crf", crf, "-preset", preset])
+                    # ensure format during filter graph too (safer for odd inputs)
+                    ffmpeg_cmd.extend(["-vf", "format=yuv420p"])
+                elif selected_v == "libx265":
+                    # still force 8-bit unless you have 10-bit build; 8-bit is most compatible
+                    ffmpeg_cmd.extend(["-pix_fmt", "yuv420p"])
+
+                # ---- SUBS/ATTACHMENTS/DATA ----
+                ffmpeg_cmd.extend(["-c:s", self.config["subtitle_codec"]])
+                ffmpeg_cmd.extend(["-c:t", "copy", "-c:d", "copy"])
+
+                # ---- AUDIO handling ----
                 a_bitrate = self.config["bitrate"]
                 a_channels = int(self.config["channels"])
                 a_rate = int(self.config["samplerate"])
 
-                for idx, _ in enumerate(audio_streams):
-                    ffmpeg_cmd.extend([
-                        f"-c:a:{idx}", "aac",
-                        f"-b:a:{idx}", a_bitrate,
-                        f"-ac:a:{idx}", str(a_channels),
-                        f"-ar:a:{idx}", str(a_rate),
-                    ])
+                if audio_streams:
+                    for idx, _ in enumerate(audio_streams):
+                        ffmpeg_cmd.extend([
+                            f"-c:a:{idx}", "aac",
+                            f"-b:a:{idx}", a_bitrate,
+                            f"-ac:a:{idx}", str(a_channels),
+                            f"-ar:a:{idx}", str(a_rate),
+                        ])
+                else:
+                    ffmpeg_cmd.extend(["-c:a", "aac", "-b:a", a_bitrate, "-ac", str(a_channels), "-ar", str(a_rate)])
+
                 ffmpeg_cmd.extend(["-aac_coder", "twoloop"])
 
                 if self.config.get("metadata_title"):
@@ -206,12 +285,12 @@ class AudioConverterThread(QThread):
                     total_size_bytes = 0
                     speed_x = 0.0
                     have_time = False
-
-                    target_bps = parse_bitrate_to_bps(self.config["bitrate"]) * max(len(audio_streams), 1)
-                    if target_bps <= 0:
-                        target_bps = 192000 * max(len(audio_streams), 1)
-
                     last_poll = 0.0
+
+                    # target bitrate for fallback size-based progress
+                    target_bps = parse_bitrate_to_bps(self.config["bitrate"]) * max(assumed_count, 1)
+                    if target_bps <= 0:
+                        target_bps = 192000 * max(assumed_count, 1)
 
                     # start in indeterminate mode until we glean something
                     self.file_progress_updated.emit(-1)
@@ -222,7 +301,6 @@ class AudioConverterThread(QThread):
                             process.terminate()
                             break
 
-                        # Read a progress line if available
                         line = process.stdout.readline()
                         if not line and process.poll() is not None:
                             break
@@ -256,7 +334,11 @@ class AudioConverterThread(QThread):
                                     except Exception:
                                         pass
                                 elif key == "speed":
-                                    speed_x = parse_speed_x(value)
+                                    try:
+                                        v = value.strip().lower().rstrip('x')
+                                        speed_x = float(v)
+                                    except Exception:
+                                        speed_x = 0.0
 
                         # Poll actual on-disk file size as an extra fallback
                         now = time.time()
@@ -370,8 +452,8 @@ class AudioConverterThread(QThread):
 class AudioNormalizationApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Audio Normalization to AAC (improved)")
-        self.setGeometry(100, 100, 900, 650)
+        self.setWindowTitle("Audio Normalization to AAC (Jellyfin‑friendly)")
+        self.setGeometry(100, 100, 980, 700)
 
         self.config = {
             "output_dir": "converted",
@@ -380,7 +462,10 @@ class AudioNormalizationApp(QMainWindow):
             "samplerate": 48000,
             "video_codec": "copy",
             "subtitle_codec": "copy",
-            "metadata_title": "AAC Stereo"
+            "metadata_title": "AAC Stereo",
+            "force_8bit": True,   # Default ON for Jellyfin users
+            "x264_crf": 18,
+            "x264_preset": "slow",
         }
 
         self.selected_files = []
@@ -428,16 +513,16 @@ class AudioNormalizationApp(QMainWindow):
         out_row.addWidget(self.browse_output_btn)
         config_layout.addLayout(out_row)
 
+        # Audio settings
         audio_row = QHBoxLayout()
-        # Bitrate
         br_col = QVBoxLayout()
-        br_col.addWidget(QLabel("Bitrate:"))
+        br_col.addWidget(QLabel("Audio Bitrate:"))
         self.bitrate_combo = QComboBox()
         self.bitrate_combo.addItems(["128k","192k","224k","256k","320k","384k","448k","512k","640k"])
         self.bitrate_combo.setCurrentText(self.config["bitrate"])
         br_col.addWidget(self.bitrate_combo)
         audio_row.addLayout(br_col)
-        # Channels
+
         ch_col = QVBoxLayout()
         ch_col.addWidget(QLabel("Channels:"))
         self.channels_combo = QComboBox()
@@ -445,7 +530,7 @@ class AudioNormalizationApp(QMainWindow):
         self.channels_combo.setCurrentText(str(self.config["channels"]))
         ch_col.addWidget(self.channels_combo)
         audio_row.addLayout(ch_col)
-        # Sample rate
+
         sr_col = QVBoxLayout()
         sr_col.addWidget(QLabel("Sample Rate:"))
         self.samplerate_combo = QComboBox()
@@ -456,21 +541,49 @@ class AudioNormalizationApp(QMainWindow):
 
         config_layout.addLayout(audio_row)
 
-        codec_row = QHBoxLayout()
+        # Video settings
+        video_row1 = QHBoxLayout()
         v_col = QVBoxLayout()
         v_col.addWidget(QLabel("Video Codec:"))
         self.video_codec_combo = QComboBox()
         self.video_codec_combo.addItems(["copy","libx264","libx265"])
         self.video_codec_combo.setCurrentText(self.config["video_codec"])
         v_col.addWidget(self.video_codec_combo)
-        codec_row.addLayout(v_col)
+        video_row1.addLayout(v_col)
+
         s_col = QVBoxLayout()
         s_col.addWidget(QLabel("Subtitle Codec:"))
         self.subtitle_codec_combo = QComboBox()
         self.subtitle_codec_combo.addItems(["copy","mov_text"])
         self.subtitle_codec_combo.setCurrentText(self.config["subtitle_codec"])
         s_col.addWidget(self.subtitle_codec_combo)
-        codec_row.addLayout(s_col)
+        video_row1.addLayout(s_col)
+
+        config_layout.addLayout(video_row1)
+
+        video_row2 = QHBoxLayout()
+        self.force8_checkbox = QCheckBox("Force 10‑bit → 8‑bit (yuv420p) for Jellyfin")
+        self.force8_checkbox.setChecked(self.config["force_8bit"])
+        video_row2.addWidget(self.force8_checkbox)
+
+        crf_col = QVBoxLayout()
+        crf_col.addWidget(QLabel("x264 CRF:"))
+        self.crf_combo = QComboBox()
+        self.crf_combo.addItems([str(x) for x in [16,17,18,19,20,21,22,23,24]])
+        self.crf_combo.setCurrentText(str(self.config["x264_crf"]))
+        crf_col.addWidget(self.crf_combo)
+        video_row2.addLayout(crf_col)
+
+        preset_col = QVBoxLayout()
+        preset_col.addWidget(QLabel("x264 Preset:"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(["veryslow","slower","slow","medium","fast","faster"])
+        self.preset_combo.setCurrentText(self.config["x264_preset"])
+        preset_col.addWidget(self.preset_combo)
+        video_row2.addLayout(preset_col)
+
+        config_layout.addLayout(video_row2)
+
         config_group.setLayout(config_layout)
 
         top_layout.addWidget(file_group)
@@ -528,7 +641,7 @@ class AudioNormalizationApp(QMainWindow):
         splitter.addWidget(top_widget)
         splitter.addWidget(progress_widget)
         splitter.addWidget(log_widget)
-        splitter.setSizes([320, 120, 260])
+        splitter.setSizes([360, 140, 280])
 
         main_layout.addWidget(splitter)
         main_layout.addLayout(action_layout)
@@ -592,6 +705,9 @@ class AudioNormalizationApp(QMainWindow):
         self.config["video_codec"] = self.video_codec_combo.currentText()
         self.config["subtitle_codec"] = self.subtitle_codec_combo.currentText()
         self.config["metadata_title"] = "AAC Stereo"
+        self.config["force_8bit"] = self.force8_checkbox.isChecked()
+        self.config["x264_crf"] = int(self.crf_combo.currentText())
+        self.config["x264_preset"] = self.preset_combo.currentText()
 
         os.makedirs(self.config["output_dir"], exist_ok=True)
 
@@ -629,12 +745,10 @@ class AudioNormalizationApp(QMainWindow):
 
     def update_file_progress(self, value):
         if value < 0:
-            # indeterminate
-            self.file_progress_bar.setRange(0, 0)
+            self.file_progress_bar.setRange(0, 0)  # indeterminate
         else:
             if self.file_progress_bar.minimum() == 0 and self.file_progress_bar.maximum() == 0:
-                # switch back to determinate
-                self.file_progress_bar.setRange(0, 100)
+                self.file_progress_bar.setRange(0, 100)  # determinate
             self.file_progress_bar.setValue(value)
         QApplication.processEvents()
 
